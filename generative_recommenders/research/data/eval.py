@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set, Union
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 from generative_recommenders.research.indexing.candidate_index import (
     CandidateIndex,
@@ -104,13 +105,14 @@ def eval_metrics_v2_from_tensors(
 
     # computes ro- part exactly once.
     # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
-    shared_input_embeddings = model.encode(
-        past_lengths=seq_features.past_lengths,
-        past_ids=seq_features.past_ids,
-        # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
-        past_embeddings=model.get_item_embeddings(seq_features.past_ids),
-        past_payloads=seq_features.past_payloads,
-    )
+    with nvtx.range("HSTU_Model_Encode"):
+        shared_input_embeddings = model.encode(
+            past_lengths=seq_features.past_lengths,
+            past_ids=seq_features.past_ids,
+            # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
+            past_embeddings=model.get_item_embeddings(seq_features.past_ids),
+            past_payloads=seq_features.past_payloads,
+        )
     if dtype is not None:
         shared_input_embeddings = shared_input_embeddings.to(dtype)
 
@@ -123,23 +125,24 @@ def eval_metrics_v2_from_tensors(
     eval_top_k_ids_all = []
     eval_top_k_prs_all = []
     for mb in range(num_batches):
-        eval_top_k_ids, eval_top_k_prs, _ = (
-            eval_state.candidate_index.get_top_k_outputs(
-                query_embeddings=shared_input_embeddings[
-                    mb * user_max_batch_size : (mb + 1) * user_max_batch_size, ...
-                ],
-                top_k_module=eval_state.top_k_module,
-                k=k,
-                invalid_ids=(
-                    seq_features.past_ids[
-                        mb * user_max_batch_size : (mb + 1) * user_max_batch_size, :
-                    ]
-                    if filter_invalid_ids
-                    else None
-                ),
-                return_embeddings=False,
+        with nvtx.range(f"TopK_Search_Batch_{mb}"):
+            eval_top_k_ids, eval_top_k_prs, _ = (
+                eval_state.candidate_index.get_top_k_outputs(
+                    query_embeddings=shared_input_embeddings[
+                        mb * user_max_batch_size : (mb + 1) * user_max_batch_size, ...
+                    ],
+                    top_k_module=eval_state.top_k_module,
+                    k=k,
+                    invalid_ids=(
+                        seq_features.past_ids[
+                            mb * user_max_batch_size : (mb + 1) * user_max_batch_size, :
+                        ]
+                        if filter_invalid_ids
+                        else None
+                    ),
+                    return_embeddings=False,
+                )
             )
-        )
         eval_top_k_ids_all.append(eval_top_k_ids)
         eval_top_k_prs_all.append(eval_top_k_prs)
 

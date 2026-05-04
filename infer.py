@@ -11,6 +11,7 @@ from typing import Dict, Optional
 
 import gin
 import torch
+import torch.cuda.nvtx as nvtx
 import fbgemm_gpu
 from generative_recommenders.research.data.eval import (
     _avg,
@@ -219,15 +220,17 @@ def train_fn(
             seq_features, target_ids, target_ratings = movielens_seq_features_from_row(
                 row, device=device, max_output_length=gr_output_length + 1
             )
-            eval_dict = eval_metrics_v2_from_tensors(
-                eval_state,
-                model,
-                seq_features,
-                target_ids=target_ids,
-                target_ratings=target_ratings,
-                user_max_batch_size=eval_user_max_batch_size,
-                dtype=torch.bfloat16 if main_module_bf16 else None,
-            )
+            
+            with nvtx.range(f"Eval_Iter_{eval_iter}"):
+                eval_dict = eval_metrics_v2_from_tensors(
+                    eval_state,
+                    model,
+                    seq_features,
+                    target_ids=target_ids,
+                    target_ratings=target_ratings,
+                    user_max_batch_size=eval_user_max_batch_size,
+                    dtype=torch.bfloat16 if main_module_bf16 else None,
+                )
             
             if eval_dict_all is None:
                 eval_dict_all = {}
