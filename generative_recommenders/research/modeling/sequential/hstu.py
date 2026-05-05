@@ -25,6 +25,7 @@ import math
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.nn.functional as F
 from generative_recommenders.research.modeling.sequential.embedding_modules import (
     EmbeddingModule,
@@ -163,62 +164,65 @@ def _hstu_attention_maybe_from_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B: int = x_offsets.size(0) - 1
     n: int = invalid_attn_mask.size(-1)
-    if delta_x_offsets is not None:
-        padded_q, padded_k = cached_q, cached_k
-        flattened_offsets = delta_x_offsets[1] + torch.arange(
-            start=0,
-            end=B * n,
-            step=n,
-            device=delta_x_offsets[1].device,
-            dtype=delta_x_offsets[1].dtype,
-        )
-        assert isinstance(padded_q, torch.Tensor)
-        assert isinstance(padded_k, torch.Tensor)
-        padded_q = (
-            padded_q.view(B * n, -1)
-            .index_copy_(
-                dim=0,
-                index=flattened_offsets,
-                source=q,
+    with nvtx.range("Attention (others)"):
+        if delta_x_offsets is not None:
+            padded_q, padded_k = cached_q, cached_k
+            flattened_offsets = delta_x_offsets[1] + torch.arange(
+                start=0,
+                end=B * n,
+                step=n,
+                device=delta_x_offsets[1].device,
+                dtype=delta_x_offsets[1].dtype,
             )
-            .view(B, n, -1)
-        )
-        padded_k = (
-            padded_k.view(B * n, -1)
-            .index_copy_(
-                dim=0,
-                index=flattened_offsets,
-                source=k,
+            assert isinstance(padded_q, torch.Tensor)
+            assert isinstance(padded_k, torch.Tensor)
+            padded_q = (
+                padded_q.view(B * n, -1)
+                .index_copy_(
+                    dim=0,
+                    index=flattened_offsets,
+                    source=q,
+                )
+                .view(B, n, -1)
             )
-            .view(B, n, -1)
-        )
-    else:
-        padded_q = torch.ops.fbgemm.jagged_to_padded_dense(
-            values=q, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
-        )
-        padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
-            values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
-        )
+            padded_k = (
+                padded_k.view(B * n, -1)
+                .index_copy_(
+                    dim=0,
+                    index=flattened_offsets,
+                    source=k,
+                )
+                .view(B, n, -1)
+            )
+        else:
+            padded_q = torch.ops.fbgemm.jagged_to_padded_dense(
+                values=q, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
+            )
+            padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
+                values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
+            )
 
-    qk_attn = torch.einsum(
-        "bnhd,bmhd->bhnm",
-        padded_q.view(B, n, num_heads, attention_dim),
-        padded_k.view(B, n, num_heads, attention_dim),
-    )
+        qk_attn = torch.einsum(
+            "bnhd,bmhd->bhnm",
+            padded_q.view(B, n, num_heads, attention_dim),
+            padded_k.view(B, n, num_heads, attention_dim),
+        )
     if all_timestamps is not None:
-        qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
-    qk_attn = F.silu(qk_attn) / n
-    qk_attn = qk_attn * invalid_attn_mask.unsqueeze(0).unsqueeze(0)
-    attn_output = torch.ops.fbgemm.dense_to_jagged(
-        torch.einsum(
-            "bhnm,bmhd->bnhd",
-            qk_attn,
-            torch.ops.fbgemm.jagged_to_padded_dense(v, [x_offsets], [n]).reshape(
-                B, n, num_heads, linear_dim
-            ),
-        ).reshape(B, n, num_heads * linear_dim),
-        [x_offsets],
-    )[0]
+        with nvtx.range("Attention (bias)"):
+            qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
+    with nvtx.range("Attention (others)"):
+        qk_attn = F.silu(qk_attn) / n
+        qk_attn = qk_attn * invalid_attn_mask.unsqueeze(0).unsqueeze(0)
+        attn_output = torch.ops.fbgemm.dense_to_jagged(
+            torch.einsum(
+                "bhnm,bmhd->bnhd",
+                qk_attn,
+                torch.ops.fbgemm.jagged_to_padded_dense(v, [x_offsets], [n]).reshape(
+                    B, n, num_heads, linear_dim
+                ),
+            ).reshape(B, n, num_heads * linear_dim),
+            [x_offsets],
+        )[0]
     return attn_output, padded_q, padded_k
 
 
@@ -314,29 +318,32 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
             x = x[delta_x_offsets[0], :]
             cached_v, cached_q, cached_k, cached_outputs = cache
 
-        normed_x = self._norm_input(x)
+        with nvtx.range("Others"):
+            normed_x = self._norm_input(x)
 
         if self._linear_config == "uvqk":
-            batched_mm_output = torch.mm(normed_x, self._uvqk)
-            if self._linear_activation == "silu":
-                batched_mm_output = F.silu(batched_mm_output)
-            elif self._linear_activation == "none":
-                batched_mm_output = batched_mm_output
-            u, v, q, k = torch.split(
-                batched_mm_output,
-                [
-                    self._linear_dim * self._num_heads,
-                    self._linear_dim * self._num_heads,
-                    self._attention_dim * self._num_heads,
-                    self._attention_dim * self._num_heads,
-                ],
-                dim=1,
-            )
+            with nvtx.range("QKVU projection"):
+                batched_mm_output = torch.mm(normed_x, self._uvqk)
+                if self._linear_activation == "silu":
+                    batched_mm_output = F.silu(batched_mm_output)
+                elif self._linear_activation == "none":
+                    batched_mm_output = batched_mm_output
+                u, v, q, k = torch.split(
+                    batched_mm_output,
+                    [
+                        self._linear_dim * self._num_heads,
+                        self._linear_dim * self._num_heads,
+                        self._attention_dim * self._num_heads,
+                        self._attention_dim * self._num_heads,
+                    ],
+                    dim=1,
+                )
         else:
             raise ValueError(f"Unknown self._linear_config {self._linear_config}")
 
         if delta_x_offsets is not None:
-            v = cached_v.index_copy_(dim=0, index=delta_x_offsets[0], source=v)
+            with nvtx.range("Others"):
+                v = cached_v.index_copy_(dim=0, index=delta_x_offsets[0], source=v)
 
         B: int = x_offsets.size(0) - 1
         if self._normalization == "rel_bias" or self._normalization == "hstu_rel_bias":
@@ -357,88 +364,95 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 rel_attn_bias=self._rel_attn_bias,
             )
         elif self._normalization == "softmax_rel_bias":
-            if delta_x_offsets is not None:
-                B = x_offsets.size(0) - 1
-                padded_q, padded_k = cached_q, cached_k
-                flattened_offsets = delta_x_offsets[1] + torch.arange(
-                    start=0,
-                    end=B * n,
-                    step=n,
-                    device=delta_x_offsets[1].device,
-                    dtype=delta_x_offsets[1].dtype,
-                )
-                assert padded_q is not None
-                assert padded_k is not None
-                padded_q = (
-                    padded_q.view(B * n, -1)
-                    .index_copy_(
-                        dim=0,
-                        index=flattened_offsets,
-                        source=q,
+            with nvtx.range("Attention (others)"):
+                if delta_x_offsets is not None:
+                    B = x_offsets.size(0) - 1
+                    padded_q, padded_k = cached_q, cached_k
+                    flattened_offsets = delta_x_offsets[1] + torch.arange(
+                        start=0,
+                        end=B * n,
+                        step=n,
+                        device=delta_x_offsets[1].device,
+                        dtype=delta_x_offsets[1].dtype,
                     )
-                    .view(B, n, -1)
-                )
-                padded_k = (
-                    padded_k.view(B * n, -1)
-                    .index_copy_(
-                        dim=0,
-                        index=flattened_offsets,
-                        source=k,
+                    assert padded_q is not None
+                    assert padded_k is not None
+                    padded_q = (
+                        padded_q.view(B * n, -1)
+                        .index_copy_(
+                            dim=0,
+                            index=flattened_offsets,
+                            source=q,
+                        )
+                        .view(B, n, -1)
                     )
-                    .view(B, n, -1)
-                )
-            else:
-                padded_q = torch.ops.fbgemm.jagged_to_padded_dense(
-                    values=q, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
-                )
-                padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
-                    values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
-                )
+                    padded_k = (
+                        padded_k.view(B * n, -1)
+                        .index_copy_(
+                            dim=0,
+                            index=flattened_offsets,
+                            source=k,
+                        )
+                        .view(B, n, -1)
+                    )
+                else:
+                    padded_q = torch.ops.fbgemm.jagged_to_padded_dense(
+                        values=q, offsets=[x_offsets], max_lengths=[n],
+ padding_value=0.0
+                    )
+                    padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
+                        values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0,
+                    )
 
-            qk_attn = torch.einsum("bnd,bmd->bnm", padded_q, padded_k)
+                qk_attn = torch.einsum("bnd,bmd->bnm", padded_q, padded_k)
             if self._rel_attn_bias is not None:
-                qk_attn = qk_attn + self._rel_attn_bias(all_timestamps)
-            qk_attn = F.softmax(qk_attn / math.sqrt(self._attention_dim), dim=-1)
-            qk_attn = qk_attn * invalid_attn_mask
-            attn_output = torch.ops.fbgemm.dense_to_jagged(
-                torch.bmm(
-                    qk_attn,
-                    torch.ops.fbgemm.jagged_to_padded_dense(v, [x_offsets], [n]),
-                ),
-                [x_offsets],
-            )[0]
+                with nvtx.range("Attention (bias)"):
+                    qk_attn = qk_attn + self._rel_attn_bias(all_timestamps)
+            with nvtx.range("Attention (others)"):
+                qk_attn = F.softmax(qk_attn / math.sqrt(self._attention_dim), dim=-1)
+                qk_attn = qk_attn * invalid_attn_mask
+                attn_output = torch.ops.fbgemm.dense_to_jagged(
+                    torch.bmm(
+                        qk_attn,
+                        torch.ops.fbgemm.jagged_to_padded_dense(v, [x_offsets], [n]),
+                    ),
+                    [x_offsets],
+                )[0]
         else:
             raise ValueError(f"Unknown normalization method {self._normalization}")
 
-        attn_output = (
-            attn_output
-            if delta_x_offsets is None
-            else attn_output[delta_x_offsets[0], :]
-        )
-        if self._concat_ua:
-            a = self._norm_attn_output(attn_output)
-            o_input = torch.cat([u, a, u * a], dim=-1)
-        else:
-            o_input = u * self._norm_attn_output(attn_output)
-
-        new_outputs = (
-            self._o(
-                F.dropout(
-                    o_input,
-                    p=self._dropout_ratio,
-                    training=self.training,
-                )
+        with nvtx.range("Transformation"):
+            attn_output = (
+                attn_output
+                if delta_x_offsets is None
+                else attn_output[delta_x_offsets[0], :]
             )
-            + x
-        )
+            if self._concat_ua:
+                a = self._norm_attn_output(attn_output)
+                o_input = torch.cat([u, a, u * a], dim=-1)
+            else:
+                o_input = u * self._norm_attn_output(attn_output)
+
+            new_outputs = (
+                self._o(
+                    F.dropout(
+                        o_input,
+                        p=self._dropout_ratio,
+                        training=self.training,
+                    )
+                )
+                + x
+            )
 
         if delta_x_offsets is not None:
-            new_outputs = cached_outputs.index_copy_(
-                dim=0, index=delta_x_offsets[0], source=new_outputs
-            )
+            with nvtx.range("Others"):
+                new_outputs = cached_outputs.index_copy_(
+                    dim=0, index=delta_x_offsets[0], source=new_outputs
+                )
 
         if return_cache_states and delta_x_offsets is None:
-            v = v.contiguous()
+            with nvtx.range("Others"):
+                v = v.contiguous()
 
         return new_outputs, (v, padded_q, padded_k, new_outputs)
 
@@ -519,7 +533,8 @@ class HSTUJagged(torch.nn.Module):
             x' = f(x), (B, N, D) x float
         """
         if len(x.size()) == 3:
-            x = torch.ops.fbgemm.dense_to_jagged(x, [x_offsets])[0]
+            with nvtx.range("Others"):
+                x = torch.ops.fbgemm.dense_to_jagged(x, [x_offsets])[0]
 
         jagged_x, cache_states = self.jagged_forward(
             x=x,
@@ -530,12 +545,13 @@ class HSTUJagged(torch.nn.Module):
             cache=cache,
             return_cache_states=return_cache_states,
         )
-        y = torch.ops.fbgemm.jagged_to_padded_dense(
-            values=jagged_x,
-            offsets=[x_offsets],
-            max_lengths=[invalid_attn_mask.size(1)],
-            padding_value=0.0,
-        )
+        with nvtx.range("Others"):
+            y = torch.ops.fbgemm.jagged_to_padded_dense(
+                values=jagged_x,
+                offsets=[x_offsets],
+                max_lengths=[invalid_attn_mask.size(1)],
+                padding_value=0.0,
+            )
         return y, cache_states
 
 
@@ -684,17 +700,20 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
         float_dtype = past_embeddings.dtype
         B, N, _ = past_embeddings.size()
 
-        past_lengths, user_embeddings, _ = self._input_features_preproc(
-            past_lengths=past_lengths,
-            past_ids=past_ids,
-            past_embeddings=past_embeddings,
-            past_payloads=past_payloads,
-        )
+        with nvtx.range("Others"):
+            past_lengths, user_embeddings, _ = self._input_features_preproc(
+                past_lengths=past_lengths,
+                past_ids=past_ids,
+                past_embeddings=past_embeddings,
+                past_payloads=past_payloads,
+            )
 
         float_dtype = user_embeddings.dtype
+        with nvtx.range("Others"):
+            x_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(past_lengths)
         user_embeddings, cached_states = self._hstu(
             x=user_embeddings,
-            x_offsets=torch.ops.fbgemm.asynchronous_complete_cumsum(past_lengths),
+            x_offsets=x_offsets,
             all_timestamps=(
                 past_payloads[TIMESTAMPS_KEY]
                 if TIMESTAMPS_KEY in past_payloads
@@ -705,7 +724,9 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
             cache=cache,
             return_cache_states=return_cache_states,
         )
-        return self._output_postproc(user_embeddings), cached_states
+        with nvtx.range("Others"):
+            user_embeddings = self._output_postproc(user_embeddings)
+        return user_embeddings, cached_states
 
     def forward(
         self,
