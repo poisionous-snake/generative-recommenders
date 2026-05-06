@@ -47,6 +47,48 @@ from generative_recommenders.research.rails.similarities.module import Similarit
 
 TIMESTAMPS_KEY = "timestamps"
 
+# Profiling storage
+_PROFILE_TIMES: dict[str, list[float]] = {
+    "QKVU projection": [],
+    "Attention (bias)": [],
+    "Attention (others)": [],
+    "Transformation": [],
+    "Others": [],
+}
+_PROFILE_ENABLED: bool = False
+
+def enable_profile():
+    global _PROFILE_ENABLED
+    _PROFILE_ENABLED = True
+
+def disable_profile():
+    global _PROFILE_ENABLED
+    _PROFILE_ENABLED = False
+
+def clear_profile_times():
+    for key in _PROFILE_TIMES:
+        _PROFILE_TIMES[key].clear()
+
+def get_profile_times() -> dict[str, list[float]]:
+    return _PROFILE_TIMES.copy()
+
+def print_profile_summary():
+    import statistics
+    print("\n" + "="*80)
+    print("Profiling Summary (ms):")
+    print("="*80)
+    for name, times in _PROFILE_TIMES.items():
+        if times:
+            mean = statistics.mean(times)
+            median = statistics.median(times)
+            std = statistics.stdev(times) if len(times) > 1 else 0
+            print(f"{name}:")
+            print(f"  Mean: {mean:.4f}")
+            print(f"  Median: {median:.4f}")
+            print(f"  Std: {std:.4f}")
+            print(f"  Samples: {len(times)}")
+    print("="*80 + "\n")
+
 
 class RelativeAttentionBiasModule(torch.nn.Module):
     @abc.abstractmethod
@@ -164,6 +206,15 @@ def _hstu_attention_maybe_from_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B: int = x_offsets.size(0) - 1
     n: int = invalid_attn_mask.size(-1)
+
+    if _PROFILE_ENABLED:
+        attn_others_start = torch.cuda.Event(enable_timing=True)
+        attn_others_end = torch.cuda.Event(enable_timing=True)
+        attn_bias_start = torch.cuda.Event(enable_timing=True)
+        attn_bias_end = torch.cuda.Event(enable_timing=True)
+
+    if _PROFILE_ENABLED:
+        attn_others_start.record()
     with nvtx.range("Attention (others)"):
         if delta_x_offsets is not None:
             padded_q, padded_k = cached_q, cached_k
@@ -207,9 +258,23 @@ def _hstu_attention_maybe_from_cache(
             padded_q.view(B, n, num_heads, attention_dim),
             padded_k.view(B, n, num_heads, attention_dim),
         )
+    if _PROFILE_ENABLED:
+        attn_others_end.record()
+        torch.cuda.synchronize()
+        _PROFILE_TIMES["Attention (others)"].append(attn_others_start.elapsed_time(attn_others_end))
+
     if all_timestamps is not None:
+        if _PROFILE_ENABLED:
+            attn_bias_start.record()
         with nvtx.range("Attention (bias)"):
             qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
+        if _PROFILE_ENABLED:
+            attn_bias_end.record()
+            torch.cuda.synchronize()
+            _PROFILE_TIMES["Attention (bias)"].append(attn_bias_start.elapsed_time(attn_bias_end))
+
+    if _PROFILE_ENABLED:
+        attn_others_start.record()
     with nvtx.range("Attention (others)"):
         qk_attn = F.silu(qk_attn) / n
         qk_attn = qk_attn * invalid_attn_mask.unsqueeze(0).unsqueeze(0)
@@ -223,6 +288,11 @@ def _hstu_attention_maybe_from_cache(
             ).reshape(B, n, num_heads * linear_dim),
             [x_offsets],
         )[0]
+    if _PROFILE_ENABLED:
+        attn_others_end.record()
+        torch.cuda.synchronize()
+        _PROFILE_TIMES["Attention (others)"].append(attn_others_start.elapsed_time(attn_others_end))
+
     return attn_output, padded_q, padded_k
 
 
@@ -308,6 +378,24 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         Returns:
             x' = f(x), (\sum_i N_i, D) x float.
         """
+        # Create events for profiling
+        if _PROFILE_ENABLED:
+            # QKVU projection
+            qkvu_start = torch.cuda.Event(enable_timing=True)
+            qkvu_end = torch.cuda.Event(enable_timing=True)
+            # Attention (bias)
+            attn_bias_start = torch.cuda.Event(enable_timing=True)
+            attn_bias_end = torch.cuda.Event(enable_timing=True)
+            # Attention (others)
+            attn_others_start = torch.cuda.Event(enable_timing=True)
+            attn_others_end = torch.cuda.Event(enable_timing=True)
+            # Transformation
+            transf_start = torch.cuda.Event(enable_timing=True)
+            transf_end = torch.cuda.Event(enable_timing=True)
+            # Others
+            others_start = torch.cuda.Event(enable_timing=True)
+            others_end = torch.cuda.Event(enable_timing=True)
+
         n: int = invalid_attn_mask.size(-1)
         cached_q = None
         cached_k = None
@@ -318,9 +406,17 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
             x = x[delta_x_offsets[0], :]
             cached_v, cached_q, cached_k, cached_outputs = cache
 
+        if _PROFILE_ENABLED:
+            others_start.record()
         with nvtx.range("Others"):
             normed_x = self._norm_input(x)
+        if _PROFILE_ENABLED:
+            others_end.record()
+            torch.cuda.synchronize()
+            _PROFILE_TIMES["Others"].append(others_start.elapsed_time(others_end))
 
+        if _PROFILE_ENABLED:
+            qkvu_start.record()
         if self._linear_config == "uvqk":
             with nvtx.range("QKVU projection"):
                 batched_mm_output = torch.mm(normed_x, self._uvqk)
@@ -340,10 +436,20 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 )
         else:
             raise ValueError(f"Unknown self._linear_config {self._linear_config}")
+        if _PROFILE_ENABLED:
+            qkvu_end.record()
+            torch.cuda.synchronize()
+            _PROFILE_TIMES["QKVU projection"].append(qkvu_start.elapsed_time(qkvu_end))
 
         if delta_x_offsets is not None:
+            if _PROFILE_ENABLED:
+                others_start.record()
             with nvtx.range("Others"):
                 v = cached_v.index_copy_(dim=0, index=delta_x_offsets[0], source=v)
+            if _PROFILE_ENABLED:
+                others_end.record()
+                torch.cuda.synchronize()
+                _PROFILE_TIMES["Others"].append(others_start.elapsed_time(others_end))
 
         B: int = x_offsets.size(0) - 1
         if self._normalization == "rel_bias" or self._normalization == "hstu_rel_bias":
@@ -364,6 +470,8 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 rel_attn_bias=self._rel_attn_bias,
             )
         elif self._normalization == "softmax_rel_bias":
+            if _PROFILE_ENABLED:
+                attn_others_start.record()
             with nvtx.range("Attention (others)"):
                 if delta_x_offsets is not None:
                     B = x_offsets.size(0) - 1
@@ -405,9 +513,23 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                     )
 
                 qk_attn = torch.einsum("bnd,bmd->bnm", padded_q, padded_k)
+            if _PROFILE_ENABLED:
+                attn_others_end.record()
+                torch.cuda.synchronize()
+                _PROFILE_TIMES["Attention (others)"].append(attn_others_start.elapsed_time(attn_others_end))
+
             if self._rel_attn_bias is not None:
+                if _PROFILE_ENABLED:
+                    attn_bias_start.record()
                 with nvtx.range("Attention (bias)"):
                     qk_attn = qk_attn + self._rel_attn_bias(all_timestamps)
+                if _PROFILE_ENABLED:
+                    attn_bias_end.record()
+                    torch.cuda.synchronize()
+                    _PROFILE_TIMES["Attention (bias)"].append(attn_bias_start.elapsed_time(attn_bias_end))
+
+            if _PROFILE_ENABLED:
+                attn_others_start.record()
             with nvtx.range("Attention (others)"):
                 qk_attn = F.softmax(qk_attn / math.sqrt(self._attention_dim), dim=-1)
                 qk_attn = qk_attn * invalid_attn_mask
@@ -418,9 +540,15 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                     ),
                     [x_offsets],
                 )[0]
+            if _PROFILE_ENABLED:
+                attn_others_end.record()
+                torch.cuda.synchronize()
+                _PROFILE_TIMES["Attention (others)"].append(attn_others_start.elapsed_time(attn_others_end))
         else:
             raise ValueError(f"Unknown normalization method {self._normalization}")
 
+        if _PROFILE_ENABLED:
+            transf_start.record()
         with nvtx.range("Transformation"):
             attn_output = (
                 attn_output
@@ -443,16 +571,32 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 )
                 + x
             )
+        if _PROFILE_ENABLED:
+            transf_end.record()
+            torch.cuda.synchronize()
+            _PROFILE_TIMES["Transformation"].append(transf_start.elapsed_time(transf_end))
 
         if delta_x_offsets is not None:
+            if _PROFILE_ENABLED:
+                others_start.record()
             with nvtx.range("Others"):
                 new_outputs = cached_outputs.index_copy_(
                     dim=0, index=delta_x_offsets[0], source=new_outputs
                 )
+            if _PROFILE_ENABLED:
+                others_end.record()
+                torch.cuda.synchronize()
+                _PROFILE_TIMES["Others"].append(others_start.elapsed_time(others_end))
 
         if return_cache_states and delta_x_offsets is None:
+            if _PROFILE_ENABLED:
+                others_start.record()
             with nvtx.range("Others"):
                 v = v.contiguous()
+            if _PROFILE_ENABLED:
+                others_end.record()
+                torch.cuda.synchronize()
+                _PROFILE_TIMES["Others"].append(others_start.elapsed_time(others_end))
 
         return new_outputs, (v, padded_q, padded_k, new_outputs)
 

@@ -13,6 +13,14 @@ import gin
 import torch
 import torch.cuda.nvtx as nvtx
 import fbgemm_gpu
+
+# Import profiling functions from hstu.py
+from generative_recommenders.research.modeling.sequential.hstu import (
+    enable_profile,
+    disable_profile,
+    clear_profile_times,
+    print_profile_summary,
+)
 from generative_recommenders.research.data.eval import (
     _avg,
     eval_metrics_v2_from_tensors,
@@ -95,6 +103,8 @@ def train_fn(
     l2_norm_eps: float = 1e-6,
     enable_tf32: bool = False,
     random_seed: int = 42,
+    num_warmups: int = 5,
+    num_trials: int = 100,
 ) -> None:
     """Inference function - accepts all train_fn parameters but only uses inference-related ones"""
     
@@ -200,7 +210,7 @@ def train_fn(
     # Eval per epoch (from train.py lines 431-487, copied directly)
     logging.info("Running inference...")
     eval_dict_all = None
-    
+
     with torch.no_grad():
         eval_state = get_eval_state(
             model=model,
@@ -215,12 +225,56 @@ def train_fn(
             device=device,
             float_dtype=torch.bfloat16 if main_module_bf16 else None,
         )
-        
+
+        # Get one batch for profiling
+        profile_row = None
+        for eval_iter, row in enumerate(iter(eval_data_loader)):
+            profile_row = row
+            break
+
+        if profile_row is not None:
+            seq_features, target_ids, target_ratings = movielens_seq_features_from_row(
+                profile_row, device=device, max_output_length=gr_output_length + 1
+            )
+
+            # Define the run function
+            def run():
+                return model.encode(
+                    past_lengths=seq_features.past_lengths,
+                    past_ids=seq_features.past_ids,
+                    past_embeddings=model.get_item_embeddings(seq_features.past_ids),
+                    past_payloads=seq_features.past_payloads,
+                )
+
+            # Warmup
+            logging.info(f"Warming up for {num_warmups} iterations...")
+            for _ in range(num_warmups):
+                run()
+            torch.cuda.synchronize()
+
+            # Enable fine-grained profiling and clear previous times
+            enable_profile()
+            clear_profile_times()
+
+            # Time it for real
+            logging.info(f"Running {num_trials} timed trials...")
+            for trial in range(num_trials):
+                run()
+                torch.cuda.synchronize()
+
+            # Disable profiling
+            disable_profile()
+
+            # Print fine-grained breakdown
+            print_profile_summary()
+
+        # Run normal eval
+        """
         for eval_iter, row in enumerate(iter(eval_data_loader)):
             seq_features, target_ids, target_ratings = movielens_seq_features_from_row(
                 row, device=device, max_output_length=gr_output_length + 1
             )
-            
+
             with nvtx.range(f"Eval_Iter_{eval_iter}"):
                 eval_dict = eval_metrics_v2_from_tensors(
                     eval_state,
@@ -231,22 +285,23 @@ def train_fn(
                     user_max_batch_size=eval_user_max_batch_size,
                     dtype=torch.bfloat16 if main_module_bf16 else None,
                 )
-            
+
             if eval_dict_all is None:
                 eval_dict_all = {}
                 for k, v in eval_dict.items():
                     eval_dict_all[k] = []
-            
+
             for k, v in eval_dict.items():
                 eval_dict_all[k] = eval_dict_all[k] + [v]
             del eval_dict
-            
+
             if (eval_iter + 1 >= partial_eval_num_iters):
                 logging.info(
                     f"Truncating eval to {eval_iter + 1} iters to save cost.."
                 )
                 break
-    
+        """
+    """
     assert eval_dict_all is not None
     for k, v in eval_dict_all.items():
         eval_dict_all[k] = torch.cat(v, dim=-1)
@@ -264,7 +319,7 @@ def train_fn(
         f"NDCG@10 {ndcg_10:.4f}, NDCG@50 {ndcg_50:.4f}, HR@10 {hr_10:.4f}, HR@50 {hr_50:.4f}, MRR {mrr:.4f}"
     )
     logging.info("="*80)
-
+    """
 
 def main():
     args = parse_args()
